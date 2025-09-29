@@ -1,15 +1,12 @@
 # filepath: autogen-literature-review/autogen-literature-review/src/main.py
 import streamlit as st
-from autogen_agentchat.agents import AssistantAgent
-import asyncio
-from autogen_agentchat.teams import RoundRobinGroupChat
-from autogen_ext.models.openai import OpenAIChatCompletionClient
 import os
 import arxiv
 from typing import List, Dict
 from dotenv import load_dotenv
 import json
 import time
+import google.generativeai as genai
 
 # Load environment variables
 load_dotenv()
@@ -97,49 +94,77 @@ def arxiv_search(query: str, max_results: int = 10) -> List[Dict]:
         )
     return papers
 
-def initialize_agents():
-    """Initialize the AutoGen agents."""
-    # Check if API key is available
+SELECTED_MODEL = None
+
+def get_available_gemini_models() -> List[str]:
+    """Return a list of model names available to the API key."""
+    try:
+        models = list(genai.list_models())
+        names = []
+        for m in models:
+            name = getattr(m, "name", "")
+            methods = set(getattr(m, "supported_generation_methods", []) or [])
+            if name and ("generateContent" in methods or not methods):
+                names.append(name)
+        return sorted(names)
+    except Exception:
+        return []
+
+def setup_gemini() -> bool:
+    """Configure Gemini client using free API key from env. Returns True if OK."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        st.error("⚠️ GEMINI_API_KEY not found in environment variables!")
-        st.info("Please add your Gemini API key to your .env file or Streamlit secrets.")
-        return None, None, None
-    
-    GEMINI_brain = OpenAIChatCompletionClient(
-        model="gemini-1.5-flash-8b",
-        api_key=api_key,
-    )
+        st.error("⚠️ GEMINI_API_KEY not found. Add it to your .env or Streamlit secrets.")
+        return False
+    try:
+        genai.configure(api_key=api_key)
+        # Pick an available model that supports generateContent
+        candidates = [
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-flash-8b",
+            "gemini-1.5-pro",
+            "gemini-1.5-pro-latest",
+            "gemini-1.0-pro",
+            "gemini-pro",
+        ]
+        available = set(get_available_gemini_models())
 
-    arxiv_agent = AssistantAgent(
-        name="arxiv_agent",
-        description="An agent that helps with searching and retrieving academic papers from arXiv.",
-        model_client=GEMINI_brain,
-        tools=[arxiv_search],
-        system_message=(
-            '''Given a user topic, think of the best arXiv query and call the
-            provided tool. Always fetch five times the papers requested so
-            that you can down-select the most relevant ones. When the tool
-            returns, choose exactly the number of papers requested and pass
-            them as concise JSON to the summarizer'''
-        )
-    )
+        global SELECTED_MODEL
+        # Prefer list_models if it worked
+        for name in candidates:
+            if not available or name in available:
+                try:
+                    # Probe the model once with a trivial call
+                    _ = genai.GenerativeModel(name)
+                    SELECTED_MODEL = name
+                    break
+                except Exception:
+                    continue
+        if not SELECTED_MODEL:
+            st.error("No compatible Gemini model found for your key. Verify quota and model availability in AI Studio.")
+            return False
+        st.info(f"Using Gemini model: {SELECTED_MODEL}")
+        return True
+    except Exception as e:
+        st.error(f"Failed to configure Gemini: {e}")
+        return False
 
-    litreview_agent = AssistantAgent(
-    name="litreviewer",
-    model_client=GEMINI_brain,
-    description="Agent that helps with literature review tasks.",
-    system_message="""
+def summarize_with_gemini(paper: Dict) -> str:
+    """Use Gemini to summarize an arXiv paper in a strict template."""
+    prompt = f"""
 You are a research assistant specialized in summarizing academic papers.
-For each paper, output the following **exact structured format**:
+Follow this exact structure for the provided paper details. Do NOT return JSON.
 
 ---
-### Title: <paper title>
+### Title: {paper.get('title','')}
 
-**Author Names:** <list of authors>  
-**Publication Details:** <year, venue>  
+**Author Names:** {', '.join(paper.get('authors', []))}  
+**Publication Details:** {paper.get('published','')} (arXiv)  
 
-**Abstract:** <exact abstract from paper>  
+**Abstract:** {paper.get('summary','')}
+
+Using the abstract and any relevant background knowledge, produce the rest:
 
 **Description:** <summary in your own words>  
 
@@ -154,7 +179,6 @@ For each paper, output the following **exact structured format**:
 **Important Points:**  
 - Point 1  
 - Point 2  
-...  
 
 **Important Sentences (direct quotes):**  
 1. "..."  
@@ -165,26 +189,10 @@ For each paper, output the following **exact structured format**:
 **Advantages:** <strengths>  
 **Disadvantages:** <limitations>  
 ---
-
-⚠️ Always output in this exact structure. Do NOT return JSON. Do NOT include tool logs.
 """
-)
-
-    team = RoundRobinGroupChat(
-        participants=[arxiv_agent, litreview_agent],
-        max_turns=2
-    )
-    
-    return arxiv_agent, litreview_agent, team
-
-async def run_literature_review(team, topic: str, num_papers: int = 5):
-    """Run the literature review with the given topic and number of papers."""
-    task = f'Conduct a literature review on the topic {topic} and return exactly {num_papers} papers'
-    
-    messages = []
-    async for message in team.run_stream(task=task):
-        messages.append(message)
-        yield message
+    model = genai.GenerativeModel(SELECTED_MODEL or "gemini-1.5-flash")
+    resp = model.generate_content(prompt)
+    return resp.text or ""
 
 # Main UI
 def main():
@@ -201,12 +209,32 @@ def main():
         st.header("🔧 Configuration")
         
         # API Key status
-        api_key = os.getenv("GEMINI_API_KEY")
-        if api_key:
+        gem_key = os.getenv("GEMINI_API_KEY")
+        if gem_key:
             st.success("✅ Gemini API Key loaded")
         else:
             st.error("❌ Gemini API Key missing")
             st.info("Add GEMINI_API_KEY to your .env file")
+
+        # Model selection (optional manual override)
+        available_models: List[str] = []
+        if gem_key:
+            try:
+                genai.configure(api_key=gem_key)
+                available_models = get_available_gemini_models()
+            except Exception:
+                available_models = []
+        default_models = [
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-pro",
+            "gemini-1.0-pro",
+        ]
+        model_options = available_models or default_models
+        selected = st.selectbox("Gemini model (auto if not changed):", model_options, index=0)
+        if selected:
+            # Remember user choice
+            st.session_state["user_selected_model"] = selected
         
         st.header("📋 Agent Information")
         
@@ -258,61 +286,55 @@ def main():
             st.error("Please enter a research topic!")
             return
         
-        if not api_key:
-            st.error("Please configure your Gemini API key!")
+        # Configure Gemini and set model
+        user_selected = st.session_state.get("user_selected_model")
+        if user_selected:
+            try:
+                genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+                global SELECTED_MODEL
+                SELECTED_MODEL = user_selected
+            except Exception as e:
+                st.error(f"Failed to select model {user_selected}: {e}")
+                return
+        elif not setup_gemini():
             return
-        
-        # Initialize agents
-        with st.spinner("Initializing agents..."):
-            arxiv_agent, litreview_agent, team = initialize_agents()
-        
-        if team is None:
-            return
-        
+
         st.session_state.is_running = True
         st.session_state.results = []
-        
-        # Create placeholder for real-time updates
+
         status_placeholder = st.empty()
         results_placeholder = st.empty()
-        
-        # Run the literature review
+
         try:
-            async def run_review():
-                messages = []
-                async for message in run_literature_review(team, topic, num_papers):
-                    messages.append(message)
-                    
-                    # Update status
-                    status_placeholder.markdown(
-                        f'<p class="status-running">🔄 Processing... ({len(messages)} messages received)</p>',
-                        unsafe_allow_html=True
-                    )
-                    
-                    # Display latest message in results
-                    with results_placeholder.container():
-                        st.markdown("### 📨 Latest Agent Activity")
-                        if message:
-                            with st.expander(f"Message from {getattr(message, 'source', 'Agent')}", expanded=True):
-                                st.write(str(message))
-                
-                return messages
-            
-            # Run async function
-            messages = asyncio.run(run_review())
-            
-            # Update final status
+            with st.spinner("Searching arXiv…"):
+                papers = arxiv_search(topic, max_results=max(10, num_papers * 3))
+                papers = papers[:num_papers]
+
+            summaries = []
+            for idx, paper in enumerate(papers, start=1):
+                status_placeholder.markdown(
+                    f'<p class="status-running">🔄 Summarizing paper {idx}/{len(papers)}…</p>',
+                    unsafe_allow_html=True
+                )
+                try:
+                    text = summarize_with_gemini(paper)
+                except Exception as e:
+                    text = f"Summary failed: {e}"
+                summaries.append({"paper": paper, "summary": text})
+
+                with results_placeholder.container():
+                    st.markdown("### 📨 Latest Result")
+                    with st.expander(paper["title"], expanded=True):
+                        st.write(text)
+
+            st.session_state.results = summaries
             status_placeholder.markdown(
                 '<p class="status-complete">✅ Literature Review Complete!</p>',
                 unsafe_allow_html=True
             )
-            
-            # Store results
-            st.session_state.results = messages
             st.session_state.is_running = False
-            
-            st.success(f"🎉 Successfully completed literature review on '{topic}' with {num_papers} papers!")
-            
+            st.success(f"🎉 Successfully completed literature review on '{topic}' with {len(summaries)} papers!")
+
         except Exception as e:
             st.error(f"❌ An error occurred: {str(e)}")
             st.session_state.is_running = False
@@ -328,19 +350,19 @@ def main():
         with tab1:
             st.markdown("### 🔍 Review Summary")
             
-            # Try to extract and display structured information
-            for i, message in enumerate(st.session_state.results):
-                with st.expander(f"Result {i+1}", expanded=i == len(st.session_state.results)-1):
-                    st.write(str(message))
+            for i, item in enumerate(st.session_state.results):
+                title = item["paper"]["title"] if isinstance(item, dict) else f"Result {i+1}"
+                with st.expander(title, expanded=i == len(st.session_state.results)-1):
+                    st.write(item.get("summary", ""))
         
         with tab2:
             st.markdown("### 💬 Detailed Agent Communication")
             
-            for i, message in enumerate(st.session_state.results):
+            for i, item in enumerate(st.session_state.results):
                 st.markdown(f"""
                 <div class="result-container">
-                    <h4>Message {i+1}</h4>
-                    <pre>{str(message)}</pre>
+                    <h4>Paper {i+1}</h4>
+                    <pre>{item.get('summary','')}</pre>
                 </div>
                 """, unsafe_allow_html=True)
         
@@ -352,7 +374,7 @@ def main():
                 "topic": topic if 'topic' in locals() else "Unknown",
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "num_papers_requested": num_papers if 'num_papers' in locals() else 5,
-                "messages": [str(msg) for msg in st.session_state.results]
+                "messages": [item.get('summary','') for item in st.session_state.results]
             }
             
             # JSON download
